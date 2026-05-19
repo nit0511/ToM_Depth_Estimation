@@ -197,7 +197,109 @@ class PseudoLabelDepthDataset(Dataset):
         return {
             "image" : img_t,
             "depth" : dep_t,
-            "stem"  : img_path
+            "stem"  : img_path.stem,
         }
+    
 
 
+# Transfoms
+
+def _train_tf() -> A.Compose:
+    return A.Compose([
+        A.Resize(TARGET_H,TARGET_W),
+        A.HorizontalFlip(p=0.5),
+        A.RandomBrightnessContrast(0.2,0.2, p=0.6),
+        A.HueSaturationValue(10, 20, 10, p=0.4),
+        A.GaussianBlur(blur_limit=(3,5), p=0.2),
+        A.Normalize(mean=IMG_MEAN, std=IMG_STD),
+        ToTensorV2(),
+    ])
+
+def _val_tf() -> A.Compose:
+    return A.Compose([
+        A.Resize(TARGET_H, TARGET_W),
+        A.Normalize(mean=IMG_MEAN, std=IMG_STD),
+        ToTensorV2(),
+    ])
+
+# Model
+
+def build_model(pretrained_path: str, device: torch.device) -> nn.Module:
+    """
+    Load Depth Anything v2-small with pretrained weights.
+
+    Args:
+        pretrained_path  : Path to .pth checkpoint.
+        device           : Target device.
+    Returns:
+        Model in train mode on device
+    """
+
+    model = DepthAnythingV2(**DA_V2_SMALL_CFG)
+
+    if not Path(pretrained_path).exists():
+        raise FileNotFoundError(
+            f"Pretrained weights not found: {pretrained_path}\n"
+            "Download from: https://github.com/DepthAnything/Depth-Anything-v2"
+        )
+    
+    state = torch.load(pretrained_path, map_location="cpu")
+
+    # Handle various checkpoint fromats
+
+    if "model" in state:
+        state = state["model"]
+    elif "state_dict" in state:
+        state = state["state_dict"]
+
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        log.warning(f"Missing keys : {len(missing)} - {missing[:3]} ...")
+    if unexpected:
+        log.warning(f"Unexpected keys : {len(unexpected)} - {unexpected[:3]} ...")
+
+    log.info(f"[Model] Loaded DA v2-Small from {pretrained_path}")
+    return model.to(device).train()
+
+# Metrics
+
+@torch.no_grad()
+def compute_metrics(pred: torch.tensor, target: torch.tensor, valid_threshold: float = 1e-3,) -> Dict[str, float]:
+    """
+    Compute depth evalution metrics on a batch.
+
+    Return dict with: abs_rel, rmse, silog, deltas_1
+    """
+
+    if pred.dim() == 4: pred = pred.squeeze(1)
+    if target.dim() == 4: target = target.squeeze(1)
+
+    valid = target > valid_threshold
+    pred_v = pred[valid].clamp(min=1e-6)
+    tgt_v = target[valid].clamp(min=1e-6)
+
+    if tgt_v.numel() == 0:
+        return {"abs_rel": 0.0, "rsme": 0., "silog": 0.,"delta_1": 0.}
+    
+    # Scale-align to pred to target for metric computation
+    # (monocular prediction are relative - allign scale via median ratio)
+    scale = torch.median(tgt_v)/torch.median(pred_v)
+    pred_v = pred_v* scale
+
+    abs_rel = ((pred_v - tgt_v).abs() / tgt_v).mean().item()
+    rmse = ((pred_v - tgt_v)**2).mean().sqrt().item()
+
+    d = torch.log(pred_v) - torch.log(tgt_v)
+    n = d.numel()
+    silog = torch.sqrt(
+        (d ** 2).mean() - 0.85 * (d.mean()**2)
+    ).item()
+    thres = torch.max(pred_v/ tgt_v, tgt_v/pred_v)
+    delta_1 = (thres < 1.25).float().mean().item()
+
+    return{
+        "abs_rel" : abs_rel,
+        "rmse"    : rmse,
+        "silog"   : silog,
+        "delta_1" : delta_1  
+    }
