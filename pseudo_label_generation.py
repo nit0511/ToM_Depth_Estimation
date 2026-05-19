@@ -451,12 +451,12 @@ def process_dataset():
             f"{stem}.png"
         )
 
-        # save_depth_visualization(
-        #     image=image,
-        #     mask=mask,
-        #     depth=pseudo_depth,
-        #     save_path=viz_save_path
-        # )
+        save_depth_visualization(
+            image=image,
+            mask=mask,
+            depth=pseudo_depth,
+            save_path=viz_save_path
+        )
 
 
 
