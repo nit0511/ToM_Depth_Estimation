@@ -1,0 +1,9 @@
+datasets/
+outputs/
+cache/
+.vscode/
+__pycache__/
+*.pth
+*.ckpt
+Depth-Anything-V2/
+pseudo_generation/
