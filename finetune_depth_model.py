@@ -15,7 +15,10 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ExponentialLR
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
+from torch.amp import autocast
+
+
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
@@ -264,7 +267,7 @@ def build_model(pretrained_path: str, device: torch.device) -> nn.Module:
 # Metrics
 
 @torch.no_grad()
-def compute_metrics(pred: torch.tensor, target: torch.tensor, valid_threshold: float = 1e-3,) -> Dict[str, float]:
+def compute_metrics(pred: torch.Tensor, target: torch.Tensor, valid_threshold: float = 1e-3,) -> Dict[str, float]:
     """
     Compute depth evalution metrics on a batch.
 
@@ -303,3 +306,293 @@ def compute_metrics(pred: torch.tensor, target: torch.tensor, valid_threshold: f
         "silog"   : silog,
         "delta_1" : delta_1  
     }
+
+# Training Loop
+
+def train(args: argparse.Namespace) -> None:
+    # -----------Device------------------------
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+    log.info(f"[Train] Device: {device}")
+    if device.type == "cpu":
+        log.warning("No GPU found - training will be very slow")
+    
+    # --------------Output directory-----------
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log.info(f"[Train] checkpoints - {out_dir}")
+
+
+    # ------------Datase & DataLoaders-------------------
+    log.info("[Train] Building dataset ..........")
+    full_ds = PseudoLabelDepthDataset(args.data_dirs, transform=_train_tf())
+
+    val_size = max(1, int(len(full_ds) * args.val_split))
+    trn_size = len(full_ds) - val_size
+    generator = torch.Generator().manual_seed(42)
+    train_ds, _ = random_split(full_ds, [trn_size, val_size], generator=generator)
+
+    # Val set uses val transforms - rebuild with val_tf
+    val_full_ds = PseudoLabelDepthDataset(args.data_dirs, transform=_val_tf())
+    _, val_ds = random_split(val_full_ds,[trn_size,val_size], generator=generator)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True
+    )
+
+    val_loader = DataLoader(
+        val_ds, 
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False
+    )
+
+    log.info(f"[Train] Train: {trn_size} Val: {val_size}"
+             f"Batch: {args.batch_size}"
+             f"steps/epoch: {len(train_loader)}")
+    
+    # ------------Model------------------------------------------
+    model = build_model(args.pretrained, device)
+
+    # ------------Loss-------------------------------------------
+    criterion = SILogLoss(lambda_var=0.85)
+
+    # ----------Optimizer & Scheduler ---------------------------
+    # lr=1e-7 is intentionally very low 
+    # Higher LR destroys the model existing generalization
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4, betas=(0.9, 0.999))
+    scheduler = ExponentialLR(optimizer, gamma=0.95)
+
+    # -------------Mixed Precision Scaler----------------------
+    use_amp = (device.type == "cuda")
+    scaler = GradScaler("cuda", enabled=use_amp)
+
+    # -----------------Resume from checkpoints-----------------
+    start_epoch = 0
+    best_silog = float("inf")
+
+    resume_path = out_dir / "last_checkpoint.pth"
+    if args.resume and resume_path.exists():
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch = ckpt["epoch"] + 1
+        best_silog = ckpt.get("best_silog", float("inf"))
+        log.info(f"[Resume] Epoch {start_epoch}, best SILog={best_silog:.4f}")
+        # ----------------- Training Epochs ---------------------
+        log.info(f"\n{'-'*60}")
+        log.info(f" Starting fine-tuning: {args.epochs} epochs")
+        log.info(f" LR={args.lr:.2e} decay gamma= 0.95 loss = SILog(gamma=0.85)")
+        log.info(f"\n{'-'*60}")
+
+    for epoch in range(start_epoch, args.epochs):
+        t0 = time.time()
+    # -------------------Train Phase--------------------------
+        model.train()
+        train_loss = 0.0
+        train_steps = 0
+        for step, batch in enumerate(train_loader):
+            images = batch["image"].to(device, non_blocking=True) # [B,3, H, W]
+            depths = batch["depth"].to(device, non_blocking=True) # [B, 1, H, W]
+
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(device_type="cuda", enabled=use_amp):
+                # DA v2 forward pass - [B, H, W] relative depth
+                pred = model(images)
+
+                # Ensure [B, 1, H, W] for loss
+                if pred.dim() == 3:
+                    pred = pred.unsqueeze(1)
+                # Resize prediction to match pseudo-label resolution if needed
+                if pred.shape[-2:] != depths.shape[-2:]:
+                    pred = F.interpolate(
+                        pred, size=depths.shape[-2:],
+                        mode="bilinear", align_corner=False
+                    )
+                loss = criterion(pred, depths)
+
+            scaler.scale(loss).backward()
+            # Gradient clipping - prevants instability at very low LR
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            scaler.step(optimizer)
+            scaler.update()
+            train_loss += loss.item()
+            train_steps += 1
+
+            # --------Step-level logging every 10 steps
+            if (step + 1) % 100 == 0:
+                avg = train_loss / train_steps
+                lr = optimizer.param_groups[0]["lr"]
+                log.info(
+                    f" Epoch { epoch+1:>3}/{args.epochs} "
+                    f"Step { step+1:>4}/{len(train_loader)} "
+                    f"Loss={avg:.5} LR={lr:.2e}"
+                )
+        avg_train_loss = train_loss / max(train_steps, 1)
+        scheduler.step()
+
+        # ----------------------Validation Phase----------------
+        model.eval()
+        val_loss = 0.0
+        val_steps = 0
+        val_matrices = {"abs_rel": 0.0, "rmse":0.0, "silog":0., "delta_1": 0.0}
+
+        with torch.no_grad():
+            for batch in val_loader:
+                images = batch["image"].to(device, non_blocking=True)
+                depths = batch["depth"].to(device, non_blocking=True)
+
+                with autocast(device_type="cuda", enabled=use_amp):
+                    pred = model(images)
+                    if pred.dim() == 3:
+                        pred = pred.unsqueeze(1)
+                    if pred.shape[-2:] != depths.shape[-2:]:
+                        pred = F.interpolate(
+                            pred,size=depths.shape[-2:],
+                            mode='bilinear', align_corners=False
+                        )
+                    loss = criterion(pred, depths)
+                val_loss += loss.item()
+                val_steps += 1
+
+                m = compute_metrics(pred, depths)
+                for k, v in m.items():
+                    val_matrices[k] += v
+        avg_val_loss = val_loss / max(val_steps, 1)
+        for k in val_matrices:
+            val_matrices[k] /= max(val_steps, 1)
+        elapsed = time.time() - t0
+        lr_now = optimizer.param_groups[0]['lr']
+
+        #------------Epoch Summary----------------------------
+        log.info(
+            f"\nEpoch {epoch+1:>3}/{args.epochs} ({elapsed:.0f}s)"
+            f"LR={lr_now:.2e}\n"
+            f" Train Loss : {avg_train_loss:.5f}\n"
+            f" Val Loss : {avg_val_loss:.5f}\n"
+            f" abs_rel : {val_matrices['abs_rel']:.4f}\n"
+            f" rmse : {val_matrices['rmse']:.4f}\n"
+            f" silog : {val_matrices['silog']:.4f}\n"
+            f" delta_1 : {val_matrices['delta_1']:.4f}\n"
+            f" (target > 0.85)\n"
+        )
+
+        # ------------------------ Save last checkpoints (always) -------------------------
+        torch.save({
+            "epoch" : epoch,
+            "model" : model.state_dict(),
+            "optimizer" : optimizer.state_dict(),
+            "scheduler" : scheduler.state_dict(),
+            "best_silog" : best_silog,
+            "val_loss" : avg_val_loss,
+            "val_matrices" : val_matrices
+        }, out_dir / "last_checkpoint.pth")
+
+        # --------------------Save best model (lowest SILog)---------------------------
+        if val_matrices["silog"] < best_silog:
+            best_silog = val_matrices["silog"]
+            torch.save(
+                model.state_dict(), 
+                out_dir / "best_model.pth"
+                )
+            log.info(f" Best model saved (SILog={best_silog:.5f})")
+    log.info(f"\n{'-'*60}")
+    log.info(f" Best SILog : {best_silog:.5f}")
+    log.info(f" Best model : {out_dir / 'best_model.pth'}")
+    log.info(f"{'-'*60}\n")
+
+# Domain fine-tuning convenience wrapper
+
+def domain_finetune(
+        real_data_dir: str,
+        pretrained_path: str,
+        output_dir: str,
+        epochs: int = 10,
+        lr: float = 1e-8,
+        batch_size: int = 4,
+) -> None:
+    """
+    Domain fine-tune on real environment frames.
+
+    Separate call after main fine-tuning completes
+    Use lower LR (1e-8) after fewer epochs
+    """
+    args = argparse.Namespace(
+        data_dirs = [real_data_dir],
+        pretrained = pretrained_path,
+        output_dir= output_dir,
+        epochs= epochs,
+        lr = lr,
+        batch_size = batch_size,
+        num_workers = 2,
+        val_split = 0.15, # hold out 15% of small real-frame set
+        resume = False
+    )
+
+    log.info("\n" + "="*60)
+    log.info(" Domain fine-tuning on real environment frames")
+    log.info("="*60)
+    train(args)
+
+# CLI
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Fine-tune Depth Anything v2-Small "
+        "for glass-aware relative depth estimation"
+    )
+    p.add_argument(
+        "--data_dirs", nargs="+", required=True,
+        help="One or more directories, each with images/ and depth/ subdirs"
+    )
+    p.add_argument(
+        "--pretrained", required=True,
+        help="Path to DA v2-Small pretrained .pth weights"
+    )
+    p.add_argument(
+        "--output-dir", default="checkpoints/finetuned",
+        help="Directory to save checkpoints"
+    )
+    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--lr", type=float, default=1e-7)
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--val_split", type=float, default=0.1)
+    p.add_argument("--resume", action="store_true",
+                   help="Resume from last_checkpoint.pth in output_dir")
+    p.add_argument("--domain_finetune", action="store_true",
+                   help="Run domain fine-tune"
+                   "(uses lr=1e-8, epochs=10 on --data_dirs)")
+    return p.parse_args()
+
+# Entry point
+
+if __name__ == "__main__":
+    args = parse_args()
+    if args.domain_finetune:
+        # pass single real-frames dir
+        assert len(args.data_dirs) == 1, "--domain_finetune expect on --data_dir entry (real_frames)"
+        domain_finetune(
+            real_data_dir= args.data_dirs[0],
+            pretrained_path = args.pretrained,
+            output_dir= args.output_dir,
+            epochs=10,
+            lr = 1e-8,
+            batch_size=args.batch_size,
+        )
+    else:
+        train(args)
+
+        
+
+
